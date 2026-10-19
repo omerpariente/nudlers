@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useTheme } from '@mui/material/styles';
 import Button from '@mui/material/Button';
 import LinearProgress from '@mui/material/LinearProgress';
@@ -104,7 +104,6 @@ interface Account {
   };
 }
 
-type _GroupByType = 'vendor' | 'description' | 'last4digits';
 // DateRangeMode imported from context
 
 
@@ -197,11 +196,8 @@ const MonthlySummary: React.FC = () => {
 
     if (!cardLast4 || isNaN(targetBankId)) return;
 
-    const cardOwnershipId = cardOwnershipMap[cardLast4];
-    if (!cardOwnershipId) {
-      showSnackbar(t('summary.snackbarMoveCardNoSystemId'), 'error');
-      return;
-    }
+    // No ownership row yet -> let the API create one from the card's last 4 digits
+    const cardOwnershipId = cardOwnershipMap[cardLast4] ?? `last4:${cardLast4}`;
 
     try {
       const response = await fetch(`/api/cards/ownerships/${cardOwnershipId}`, {
@@ -212,6 +208,7 @@ const MonthlySummary: React.FC = () => {
 
       if (response.ok) {
         showSnackbar(t('summary.snackbarCardMoved'), 'success');
+        fetchCardVendors();
         fetchMonthlySummary(true);
       } else {
         showSnackbar(t('summary.snackbarFailedToMove'), 'error');
@@ -237,14 +234,9 @@ const MonthlySummary: React.FC = () => {
   // Grouping
 
 
-  // Date range error (local validation for custom range UI feedback if needed, 
-  // though context handles valid start/end dates for fetching)
-  const [_dateRangeError, setDateRangeError] = useState<string>('');
-
   // Modal for transaction details
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalData, setModalData] = useState<ModalData | undefined>();
-  const [_loadingLast4, setLoadingLast4] = useState<string | null>(null);
 
   // Card summary for cards display (grouped by last 4 digits)
   const [cardSummary, setCardSummary] = useState<CardSummary[]>([]);
@@ -288,7 +280,6 @@ const MonthlySummary: React.FC = () => {
     const endDateObj = new Date(end);
 
     if (startDateObj > endDateObj) {
-      setDateRangeError(t('summary.validationStartBeforeEnd'));
       return false;
     }
 
@@ -296,11 +287,9 @@ const MonthlySummary: React.FC = () => {
     const diffYears = diffTime / (1000 * 60 * 60 * 24 * 365);
 
     if (diffYears > MAX_YEARS_RANGE) {
-      setDateRangeError(t('summary.validationRangeExceeds', { years: MAX_YEARS_RANGE }));
       return false;
     }
 
-    setDateRangeError('');
     return true;
   };
 
@@ -361,14 +350,8 @@ const MonthlySummary: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Initialize state from local storage and settings
+    // Initialize state from settings (date persistence is handled by DateSelectionContext)
     const init = async () => {
-      // Load persistence first
-      const persistedMode = localStorage.getItem('monthlySummary_mode') as DateRangeMode | null;
-      if (persistedMode && ['billing', 'calendar'].includes(persistedMode)) {
-        setDateRangeMode(persistedMode);
-      }
-
       // Fetch available dates and initialize selection
       fetchCardVendors();
 
@@ -387,7 +370,7 @@ const MonthlySummary: React.FC = () => {
     }
 
     init();
-  }, [fetchCardVendors, setDateRangeMode]);
+  }, [fetchCardVendors]);
 
 
 
@@ -483,6 +466,9 @@ const MonthlySummary: React.FC = () => {
 
   // fetchAvailableMonths removed
 
+  // Incrementing request id — responses from superseded fetches are ignored
+  const summaryRequestIdRef = useRef(0);
+
   const fetchMonthlySummary = useCallback(async (skipLoadingState = false, _offsetValue = 0) => {
     // For custom mode, we need custom dates; for other modes, we need year/month
     if (dateRangeMode === 'custom') {
@@ -490,6 +476,8 @@ const MonthlySummary: React.FC = () => {
     } else {
       if (!selectedYear || !selectedMonth) return;
     }
+
+    const requestId = ++summaryRequestIdRef.current;
 
     // Preserve scroll position when refetching due to filter toggle
     const scrollY = window.scrollY;
@@ -524,7 +512,9 @@ const MonthlySummary: React.FC = () => {
       ]);
 
       if (accountsResponse.ok) {
-        setAccounts(await accountsResponse.json());
+        const accountsData = await accountsResponse.json();
+        if (requestId !== summaryRequestIdRef.current) return; // stale response
+        setAccounts(accountsData);
       }
 
       if (cardResponse.ok) {
@@ -547,6 +537,7 @@ const MonthlySummary: React.FC = () => {
           balance_updated_at?: string | null;
         }
         const cardResponseData = await cardResponse.json();
+        if (requestId !== summaryRequestIdRef.current) return; // stale response
         const cardResult: CardAPIResponse[] = cardResponseData.items || [];
         // Filter to include cards with expenses OR bank activity
         const cards: CardSummary[] = cardResult
@@ -679,7 +670,7 @@ const MonthlySummary: React.FC = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      if (!skipLoadingState) {
+      if (!skipLoadingState && requestId === summaryRequestIdRef.current) {
         setLoading(false);
       }
 
@@ -761,9 +752,7 @@ const MonthlySummary: React.FC = () => {
   };
 
   const handleMonthChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-    const newMonth = event.target.value;
-    setSelectedMonth(newMonth);
-    localStorage.setItem('monthlySummary_month', newMonth);
+    setSelectedMonth(event.target.value);
   };
 
   const handleCustomDateChange = (type: 'start' | 'end', value: string) => {
@@ -793,8 +782,6 @@ const MonthlySummary: React.FC = () => {
 
 
 
-  const [_loadingAll, setLoadingAll] = useState(false);
-
   const handleAllTransactionsClick = async () => {
     if (dateRangeMode === 'custom') {
       if (!customStartDate || !customEndDate) return;
@@ -803,8 +790,6 @@ const MonthlySummary: React.FC = () => {
     }
 
     try {
-      setLoadingAll(true);
-
       let url: string;
       if (billingCycle) {
         url = `/api/transactions?billingCycle=${billingCycle}`;
@@ -824,13 +809,12 @@ const MonthlySummary: React.FC = () => {
 
       setModalData({
         type: t('summary.modalTitleAllCardExpenses'),
-        data: cardTransactions
+        data: cardTransactions,
+        isBank: false
       });
       setIsModalOpen(true);
     } catch (err) {
       logger.error('Error fetching all transactions', err);
-    } finally {
-      setLoadingAll(false);
     }
   };
 
@@ -846,61 +830,6 @@ const MonthlySummary: React.FC = () => {
 
 
 
-
-  const _handleBankAccountClick = async (bank: ScrapedBankSummary) => {
-    if (dateRangeMode === 'custom') {
-      if (!customStartDate || !customEndDate) return;
-    } else {
-      if (!selectedYear || !selectedMonth) return;
-    }
-
-    try {
-      setLoading(true);
-
-      const params = new URLSearchParams();
-
-      if (dateRangeMode === 'custom') {
-        params.set('startDate', customStartDate);
-        params.set('endDate', customEndDate);
-      } else if (dateRangeMode === 'billing') {
-        params.set('billingCycle', `${selectedYear}-${selectedMonth}`);
-      } else {
-        params.set('startDate', startDate);
-        params.set('endDate', endDate);
-      }
-
-      if (bank.bank_account_id) {
-        params.set('bankAccountId', String(bank.bank_account_id));
-        if (bank.bank_account_number) {
-          params.set('bankAccountNumber', bank.bank_account_number);
-        }
-      } else {
-        params.set('bankVendor', bank.bank_account_vendor || 'Other');
-      }
-
-      const url = `/api/transactions?${params.toString()}`;
-
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error('Failed to fetch transactions');
-      }
-
-      const transactions = await response.json();
-
-      // Filter: Show ONLY bank transactions (scraped from bank)
-      const bankTransactions = transactions.filter((t: BankCheckTransaction) => isBankTransaction(t));
-
-      setModalData({
-        type: t('summary.modalTitleBankActivity', { name: bank.bank_account_nickname }),
-        data: bankTransactions
-      });
-      setIsModalOpen(true);
-    } catch (err) {
-      logger.error('Error fetching bank transactions', err);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleBankCCClick = async (bank: BankCCSummary) => {
     if (dateRangeMode === 'custom') {
@@ -957,7 +886,8 @@ const MonthlySummary: React.FC = () => {
 
       setModalData({
         type: t('summary.modalTitleCardsLinkedTo', { name: bank.bank_account_nickname }),
-        data: ccTransactions
+        data: ccTransactions,
+        isBank: false
       });
       setIsModalOpen(true);
     } catch (err) {
@@ -975,8 +905,6 @@ const MonthlySummary: React.FC = () => {
     }
 
     try {
-      setLoadingLast4(last4digits);
-
       let url: string;
       if (dateRangeMode === 'custom') {
         url = `/api/transactions?startDate=${customStartDate}&endDate=${customEndDate}&last4digits=${encodeURIComponent(last4digits)}`;
@@ -1003,13 +931,12 @@ const MonthlySummary: React.FC = () => {
         type: isBank
           ? t('summary.modalTitleAccountEnding', { last4: last4digits })
           : t('summary.modalTitleCardEnding', { last4: last4digits }),
-        data: transactions
+        data: transactions,
+        isBank: !!isBank
       });
       setIsModalOpen(true);
     } catch (err) {
       logger.error('Error fetching transactions by last4', err);
-    } finally {
-      setLoadingLast4(null);
     }
   };
 
@@ -1332,8 +1259,6 @@ const MonthlySummary: React.FC = () => {
                         ? Math.round((bank.total_cc_expenses / totals.card_expenses) * 100)
                         : 0;
 
-                      const isLargeBank = bank.card_count > 3;
-
                       const BankContent = (
                         <Box
                           key={bank.bank_account_id ? `cc-id-${bank.bank_account_id}` : `cc-nick-${bank.bank_account_nickname}`}
@@ -1347,11 +1272,6 @@ const MonthlySummary: React.FC = () => {
                             display: 'flex',
                             flexDirection: 'column',
                             transition: 'all 0.3s',
-                            gridColumn: {
-                              xs: 'span 1',
-                              sm: (isLargeBank && !isMobile) ? 'span 2' : 'span 1',
-                              lg: (isLargeBank && !isMobile) ? 'span 2' : 'span 1'
-                            },
                             '&:hover': {
                               boxShadow: '0 12px 24px -10px rgba(0, 0, 0, 0.1)',
                               bgcolor: theme.palette.mode === 'dark' ? 'rgba(30, 41, 59, 0.6)' : 'rgba(255, 255, 255, 1)',
@@ -1449,15 +1369,7 @@ const MonthlySummary: React.FC = () => {
                               </Typography>
                             </Box>
 
-                            <Box sx={{
-                              display: 'grid',
-                              gridTemplateColumns: {
-                                xs: '1fr',
-                                sm: '1fr',
-                                lg: (isLargeBank && !isMobile) ? 'repeat(2, 1fr)' : '1fr'
-                              },
-                              gap: 1
-                            }}>
+                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                               {cardSummary
                                 .filter(card => {
                                   const cardTransVendor = card.transaction_vendor;
@@ -1736,7 +1648,8 @@ const MonthlySummary: React.FC = () => {
                         const results = await response.json();
                         setModalData({
                           type: t('summary.modalTitleCategory', { name: category }),
-                          data: results
+                          data: results,
+                          isBank: false
                         });
                         setIsModalOpen(true);
                       }
